@@ -2,6 +2,7 @@ from __future__ import absolute_import, division, print_function
 import json
 import numpy as np
 from keras.preprocessing import image
+import rasterio
 from quiver_engine.imagenet_utils import preprocess_input
 
 '''
@@ -36,6 +37,19 @@ def load_img(input_path, target_shape, grayscale=False):
         img_arr = preprocess_input(img_arr)
     return img_arr
 
+def load_tif(image_path):
+    with rasterio.open(image_path) as src:
+        if 'visual' in image_path:
+            # planet images from visual asset are processed to
+            # bands red, green, blue, alpha
+            r, g, b, a = src.read()
+            x = np.array([r, g, b], dtype=np.float32)
+        elif 'analytic' in image_path:
+            r, g, b, nir = src.read()
+            x = np.array([r, g, nir], dtype=np.float32)
+
+    # return with TF ordering
+    return np.array([x]).transpose((0, 2, 3, 1))
 
 def get_json(obj):
     return json.dumps(obj, default=get_json_type)

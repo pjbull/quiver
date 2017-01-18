@@ -1,13 +1,18 @@
 from __future__ import print_function
 
+import glob
 import json
 import re
+import sys
 from contextlib import contextmanager
 
 import os
 from os import listdir
 from os.path import abspath, relpath, dirname, join
+import tempfile
 import webbrowser
+
+from PIL import Image
 
 import numpy as np
 import keras
@@ -22,7 +27,7 @@ from scipy.misc import imsave
 
 from quiver_engine.imagenet_utils import decode_imagenet_predictions
 
-from quiver_engine.util import deprocess_image, load_img, load_img_scaled, get_json
+from quiver_engine.util import deprocess_image, load_img, load_img_scaled, get_json, load_tif
 from quiver_engine.layer_result_generators import get_outputs_generator
 
 
@@ -50,8 +55,26 @@ def get_app(model, classes, top, html_base_dir, temp_folder='./tmp', input_folde
         input_channels = model.get_input_shape_at(0)[1]
 
     app = Flask(__name__)
-    app.threaded = True
+    # app.threaded = False
     CORS(app)
+
+    def get_tif_from_tmp_jpg(jpg_path):
+        filename = os.path.basename(jpg_path)
+        name_no_ext = os.path.splitext(filename)[0]
+
+        pixel_folder = "_".join(filename.split("_")[0:2])
+
+        return os.path.join(input_folder, pixel_folder, name_no_ext + ".tif")
+
+    def load_image(input_path):
+        is_grayscale = (input_channels == 1)
+        if 'tmp' in input_path:
+            tif_path = get_tif_from_tmp_jpg(input_path)
+            input_img = load_tif(tif_path)
+        else:
+            input_img = load_img(join(abspath(input_folder), input_path), single_input_shape, grayscale=is_grayscale)
+
+        return input_img
 
     @app.route('/')
     def home():
@@ -72,32 +95,66 @@ def get_app(model, classes, top, html_base_dir, temp_folder='./tmp', input_folde
 
     @app.route('/inputs')
     def get_inputs():
-        image_regex = re.compile(r".*\.(jpg|png|gif)$")
-        return jsonify([
-            filename for filename in listdir(
-                abspath(input_folder)
+        # image_regex = re.compile(r".*\.(jpg|png|gif|tif)$")
+        # image_files = [
+        #     filename for filename in listdir(
+        #         abspath(input_folder)
+        #     )
+        #     if image_regex.match(filename) is not None
+        # ]
+
+        image_files = []
+        for ext in ('*.jpg', '*.png', '*.gif', '*299x299.tif'):
+            image_files.extend(
+                glob.glob(
+                    os.path.join(
+                        input_folder,
+                        '**',
+                        ext
+                    ),
+                    recursive=True
+                )
             )
-            if image_regex.match(filename) is not None
-        ])
 
+        updated_image_files = []
+        for f in image_files:
+            if f.endswith('.tif'):
+                # can't load analytic images with PIL
+                if 'analytic' in f:
+                    continue
 
+                outfile, _ = os.path.splitext(os.path.basename(f))
+                outfile = os.path.join(temp_folder, outfile + '.jpg')
+
+                if not os.path.exists(outfile):
+                    im = Image.open(f)
+                    im.save(outfile, "JPEG", quality=100)
+
+                updated_image_files.append(outfile)
+            else:
+                updated_image_files.append(f)
+
+        return jsonify(updated_image_files)
 
     @app.route('/temp-file/<path>')
     def get_temp_file(path):
-        return send_from_directory(abspath(temp_folder), path)
+        return send_from_directory(abspath(temp_folder), os.path.basename(path))
 
-    @app.route('/input-file/<path>')
-    def get_input_file(path):
-        return send_from_directory(abspath(input_folder), path)
+    @app.route('/input-file/<path:filepath>')
+    def get_input_file(filepath):
+        filename = os.path.basename(filepath)
+        if os.path.exists(os.path.join(abspath(temp_folder), filename)):
+            return send_from_directory(abspath(temp_folder), filename)
+
+        return send_from_directory(abspath(input_folder), filepath)
 
     @app.route('/model')
     def get_config():
         return jsonify(json.loads(model.to_json()))
 
-    @app.route('/layer/<layer_name>/<input_path>')
+    @app.route('/layer/<layer_name>/<path:input_path>')
     def get_layer_outputs(layer_name, input_path):
-        is_grayscale = (input_channels == 1)
-        input_img = load_img(join(abspath(input_folder), input_path), single_input_shape, grayscale=is_grayscale)
+        input_img = load_image(input_path)
 
         output_generator = get_outputs_generator(model, layer_name)
 
@@ -108,7 +165,7 @@ def get_app(model, classes, top, html_base_dir, temp_folder='./tmp', input_folde
 
             if keras.backend.backend() == 'theano':
                 #correct for channel location difference betwen TF and Theano
-                layer_outputs = np.rollaxis(layer_outputs, 0,3)
+                layer_outputs = np.rollaxis(layer_outputs, 0, 3)
             for z in range(0, layer_outputs.shape[2]):
                 img = layer_outputs[:, :, z]
                 deprocessed = deprocess_image(img)
@@ -123,10 +180,9 @@ def get_app(model, classes, top, html_base_dir, temp_folder='./tmp', input_folde
 
         return jsonify(output_files)
 
-    @app.route('/predict/<input_path>')
+    @app.route('/predict/<path:input_path>')
     def get_prediction(input_path):
-        is_grayscale = (input_channels == 1)
-        input_img = load_img_scaled(join(abspath(input_folder), input_path), single_input_shape, grayscale=is_grayscale)
+        input_img = load_image(input_path)
         with get_evaluation_context():
             return jsonify(
                 json.loads(
@@ -142,9 +198,10 @@ def get_app(model, classes, top, html_base_dir, temp_folder='./tmp', input_folde
 
 
 def run_app(app, port=5000):
-    http_server = WSGIServer(('', port), app)
-    webbrowser.open_new('http://localhost:' + str(port))
-    http_server.serve_forever()
+    app.run(port=port, debug=True)
+    # http_server = WSGIServer(('', port), app)
+    # webbrowser.open_new('http://localhost:' + str(port))
+    # http_server.serve_forever()
 
 
 def launch(model, classes=None, top=5, temp_folder='./tmp', input_folder='./', port=5000, html_base_dir=None):
@@ -167,10 +224,16 @@ def launch(model, classes=None, top=5, temp_folder='./tmp', input_folder='./', p
 
 
 def get_output_name(temp_folder, layer_name, input_path, z_idx):
+    if os.pathsep in input_path or 'tmp' in input_path:
+        input_path = os.path.basename(input_path)
+
     return temp_folder + '/' + layer_name + '_' + str(z_idx) + '_' + input_path + '.png'
 
 
 def decode_predictions(preds, classes, top):
+    if classes == 'regression':
+        return [("", "Maize", preds)]
+
     if not classes:
         print("Warning! you didn't pass your own set of classes for the model therefore imagenet classes are used")
         return decode_imagenet_predictions(preds, top)
@@ -184,6 +247,7 @@ def decode_predictions(preds, classes, top):
         top_indices = pred.argsort()[-top:][::-1]
         result = [("", classes[i], pred[i]) for i in top_indices]
         results.append(result)
+
     return results
 
 def get_evaluation_context_getter():
